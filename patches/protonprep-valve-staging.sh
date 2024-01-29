@@ -255,6 +255,8 @@
     patch -Np1 < ../wine-staging/patches/fltmgr.sys-FltBuildDefaultSecurityDescriptor/0003-ntoskrnl.exe-Add-FltBuildDefaultSecurityDescriptor-t.patch
     
 
+    # dsound-winmm
+    patch -Np1 < ../patches/wine-hotfixes/pending/dsound_winmm.patch
 ### END WINE STAGING APPLY SECTION ###
 
 ### (2-3) GAME PATCH SECTION ###
