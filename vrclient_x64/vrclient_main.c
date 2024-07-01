@@ -13,6 +13,7 @@
 #include "initguid.h"
 #define COBJMACROS
 #include "d3d11_4.h"
+#include "vkd3d-proton-interop.h"
 #include "dxvk-interop.h"
 
 #include "vrclient_private.h"
@@ -21,11 +22,14 @@
 
 #include "wine/unixlib.h"
 
+#define PATH_MAX 4096
+
 WINE_DEFAULT_DEBUG_CHANNEL(vrclient);
 
 CREATE_TYPE_INFO_VTABLE;
 
 struct compositor_data compositor_data = {0};
+static BOOL vrclient_loaded;
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
 {
@@ -39,6 +43,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
             init_type_info_rtti( (char *)instance );
             init_rtti( (char *)instance );
 #endif /* __x86_64__ */
+            __wine_init_unix_call();
             break;
 
         case DLL_PROCESS_DETACH:
@@ -51,6 +56,8 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
                 VRCLIENT_CALL( IVRClientCore_IVRClientCore_003_Cleanup, &params );
                 compositor_data.client_core_linux_side = NULL;
             }
+            VRCLIENT_CALL( vrclient_unload, NULL );
+            vrclient_loaded = FALSE;
             break;
     }
 
@@ -104,7 +111,6 @@ static int load_vrclient(void)
 {
     static const WCHAR PROTON_VR_RUNTIME_W[] = {'P','R','O','T','O','N','_','V','R','_','R','U','N','T','I','M','E',0};
     static const WCHAR winevulkanW[] = {'w','i','n','e','v','u','l','k','a','n','.','d','l','l',0};
-    static BOOL loaded;
 
     struct vrclient_init_params params = {.winevulkan = LoadLibraryW( winevulkanW )};
     WCHAR pathW[PATH_MAX];
@@ -116,7 +122,7 @@ static int load_vrclient(void)
     static const char append_path[] = "/bin/vrclient.so";
 #endif
 
-    if (loaded) return 1;
+    if (vrclient_loaded) return 1;
 
     /* PROTON_VR_RUNTIME is provided by the proton setup script */
     if(!GetEnvironmentVariableW(PROTON_VR_RUNTIME_W, pathW, ARRAY_SIZE(pathW)))
@@ -169,10 +175,10 @@ static int load_vrclient(void)
     TRACE( "got openvr runtime path: %s\n", params.unix_path );
 
     VRCLIENT_CALL( vrclient_init, &params );
-    if (params._ret) loaded = TRUE;
+    if (params._ret) vrclient_loaded = TRUE;
 
     HeapFree( GetProcessHeap(), 0, params.unix_path );
-    return loaded;
+    return vrclient_loaded;
 }
 
 void *CDECL HmdSystemFactory(const char *name, int *return_code)
@@ -306,6 +312,7 @@ static void *ivrclientcore_get_generic_interface( void *object, const char *name
 static void destroy_compositor_data(void)
 {
     TRACE("Destroying compositor data.\n");
+    free_compositor_data_d3d12_device();
     memset(&compositor_data, 0, sizeof(compositor_data));
 }
 
@@ -354,6 +361,58 @@ w_Texture_t vrclient_translate_texture_dxvk( const w_Texture_t *texture, w_VRVul
     vkdata->m_nHeight = image_info->extent.height;
     vkdata->m_nFormat = image_info->format;
     vkdata->m_nSampleCount = image_info->samples;
+
+    vktexture = *texture;
+    vktexture.handle = vkdata;
+    vktexture.eType = TextureType_Vulkan;
+
+    return vktexture;
+}
+
+w_Texture_t vrclient_translate_texture_d3d12( const w_Texture_t *texture, w_VRVulkanTextureData_t *vkdata,
+                                              ID3D12DXVKInteropDevice *d3d12_device, ID3D12Resource *d3d12_resource,
+                                              ID3D12CommandQueue *d3d12_queue, VkImageLayout *image_layout,
+                                              VkImageCreateInfo *image_info )
+{
+    w_Texture_t vktexture;
+    VkImage image_handle;
+    UINT64 buffer_offset;
+    D3D12_RESOURCE_DESC resource_desc;
+    VkFormat vk_format = VK_FORMAT_UNDEFINED;
+    TRACE("%p %p %p %p %p %p\n", texture, vkdata, d3d12_device, d3d12_resource, d3d12_queue, image_layout);
+    d3d12_resource->lpVtbl->GetDesc(d3d12_resource, &resource_desc);
+    switch (resource_desc.Format)
+    {
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: vk_format = VK_FORMAT_R8G8B8A8_SRGB; break;
+    case DXGI_FORMAT_R8G8B8A8_UNORM: vk_format = VK_FORMAT_R8G8B8A8_UNORM; break;
+    default:
+        ERR("Unsupported DXGI format %#x.\n", resource_desc.Format);
+        return *texture;
+    }
+    if (resource_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+    {
+        ERR("Unsupported resource dimension %#x.\n", resource_desc.Dimension);
+        return *texture;
+    }
+
+    TRACE("DXGI format: %#x, width: %I64u, height: %u, mip levels: %u, array size: %u, sample count: %u, VkFormat %#x.\n",
+            resource_desc.Format, resource_desc.Width, resource_desc.Height, resource_desc.MipLevels,
+            resource_desc.DepthOrArraySize, resource_desc.SampleDesc.Count, vk_format);
+
+    d3d12_device->lpVtbl->GetVulkanHandles(d3d12_device, &vkdata->m_pInstance, &vkdata->m_pPhysicalDevice, &vkdata->m_pDevice);
+    d3d12_device->lpVtbl->GetVulkanQueueInfo(d3d12_device, d3d12_queue, &vkdata->m_pQueue, &vkdata->m_nQueueFamilyIndex);
+    d3d12_device->lpVtbl->GetVulkanImageLayout(d3d12_device, d3d12_resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, image_layout);
+    d3d12_device->lpVtbl->GetVulkanResourceInfo(d3d12_device, d3d12_resource, (UINT64*)&image_handle, &buffer_offset);
+
+    /* For now, only these fields are used. */
+    image_info->mipLevels = resource_desc.MipLevels;
+    image_info->arrayLayers = resource_desc.DepthOrArraySize;
+
+    vkdata->m_nImage = (uint64_t)image_handle;
+    vkdata->m_nWidth = resource_desc.Width;
+    vkdata->m_nHeight = resource_desc.Height;
+    vkdata->m_nFormat = vk_format;
+    vkdata->m_nSampleCount = resource_desc.SampleDesc.Count;
 
     vktexture = *texture;
     vktexture.handle = vkdata;

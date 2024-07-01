@@ -1,3 +1,5 @@
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "unix_private.h"
 
 #include <winnls.h>
@@ -5,7 +7,13 @@
 #include <stdlib.h>
 #include <dlfcn.h>
 
+#if 0
+#pragma makedep unix
+#endif
+
 WINE_DEFAULT_DEBUG_CHANNEL(steamclient);
+
+char *g_tmppath;
 
 struct callback_entry
 {
@@ -240,6 +248,15 @@ NTSTATUS ISteamClient_SteamClient020_Set_SteamAPI_CCheckCallbackRegisteredInProc
     return 0;
 }
 
+NTSTATUS ISteamClient_SteamClient021_Set_SteamAPI_CCheckCallbackRegisteredInProcess( void *args )
+{
+    struct ISteamClient_SteamClient021_Set_SteamAPI_CCheckCallbackRegisteredInProcess_params *params = (struct ISteamClient_SteamClient021_Set_SteamAPI_CCheckCallbackRegisteredInProcess_params *)args;
+    struct u_ISteamClient_SteamClient021 *iface = (struct u_ISteamClient_SteamClient021 *)params->linux_side;
+    uint32_t (*U_CDECL lin_func)(int32_t) = manual_convert_Set_SteamAPI_CCheckCallbackRegisteredInProcess_func_156( params->func );
+    iface->Set_SteamAPI_CCheckCallbackRegisteredInProcess( lin_func );
+    return 0;
+}
+
 NTSTATUS steamclient_next_callback( void *args )
 {
     struct steamclient_next_callback_params *params = (struct steamclient_next_callback_params *)args;
@@ -318,7 +335,7 @@ NTSTATUS steamclient_Steam_GetAPICallResult( void *args )
     if (params->_ret && u_callback != params->w_callback)
     {
         convert_callback_utow( params->id, u_callback, u_callback_len, params->w_callback, params->w_callback_len );
-        HeapFree( GetProcessHeap(), 0, u_callback );
+        free( u_callback );
     }
 
     return 0;
@@ -329,6 +346,8 @@ NTSTATUS steamclient_init( void *args )
     struct steamclient_init_params *params = (struct steamclient_init_params *)args;
     char path[PATH_MAX], resolved_path[PATH_MAX];
     static void *steamclient;
+
+    g_tmppath = params->g_tmppath;
 
     if (params->steam_app_id_unset) unsetenv( "SteamAppId" );
     else if (params->steam_app_id) setenv( "SteamAppId", params->steam_app_id, TRUE );
@@ -380,6 +399,7 @@ NTSTATUS steamclient_init( void *args )
     LOAD_FUNC( Steam_IsKnownInterface );
     LOAD_FUNC( Steam_NotifyMissingInterface );
 
+    TRACE( "Loaded host steamclient from %s\n", debugstr_a(path) );
     return 0;
 }
 
@@ -413,6 +433,100 @@ NTSTATUS steamclient_Steam_NotifyMissingInterface( void *args )
 
 #define IS_ABSOLUTE( x ) (*x == '/' || *x == '\\' || (*x && *(x + 1) == ':'))
 
+static void collapse_path( WCHAR *path, UINT mark )
+{
+    WCHAR *p, *next;
+
+    /* convert every / into a \ */
+    for (p = path; *p; p++) if (*p == '/') *p = '\\';
+
+    /* collapse duplicate backslashes */
+    next = path + std::max( 1u, mark );
+    for (p = next; *p; p++) if (*p != '\\' || next[-1] != '\\') *next++ = *p;
+    *next = 0;
+
+    p = path + mark;
+    while (*p)
+    {
+        if (*p == '.')
+        {
+            switch(p[1])
+            {
+            case '\\': /* .\ component */
+                next = p + 2;
+                memmove( p, next, (wcslen(next) + 1) * sizeof(WCHAR) );
+                continue;
+            case 0:  /* final . */
+                if (p > path + mark) p--;
+                *p = 0;
+                continue;
+            case '.':
+                if (p[2] == '\\')  /* ..\ component */
+                {
+                    next = p + 3;
+                    if (p > path + mark)
+                    {
+                        p--;
+                        while (p > path + mark && p[-1] != '\\') p--;
+                    }
+                    memmove( p, next, (wcslen(next) + 1) * sizeof(WCHAR) );
+                    continue;
+                }
+                else if (!p[2])  /* final .. */
+                {
+                    if (p > path + mark)
+                    {
+                        p--;
+                        while (p > path + mark && p[-1] != '\\') p--;
+                        if (p > path + mark) p--;
+                    }
+                    *p = 0;
+                    continue;
+                }
+                break;
+            }
+        }
+        /* skip to the next component */
+        while (*p && *p != '\\') p++;
+        if (*p == '\\')
+        {
+            /* remove last dot in previous dir name */
+            if (p > path + mark && p[-1] == '.') memmove( p-1, p, (wcslen(p) + 1) * sizeof(WCHAR) );
+            else p++;
+        }
+    }
+
+    /* remove trailing spaces and dots (yes, Windows really does that, don't ask) */
+    while (p > path + mark && (p[-1] == ' ' || p[-1] == '.')) p--;
+    *p = 0;
+}
+
+static char *get_unix_file_name( const WCHAR *path )
+{
+    UNICODE_STRING nt_name;
+    OBJECT_ATTRIBUTES attr;
+    NTSTATUS status;
+    ULONG size = 256;
+    char *buffer;
+
+    nt_name.Buffer = (WCHAR *)path;
+    nt_name.MaximumLength = nt_name.Length = lstrlenW( path ) * sizeof(WCHAR);
+    InitializeObjectAttributes( &attr, &nt_name, 0, 0, NULL );
+    for (;;)
+    {
+        if (!(buffer = (char *)malloc( size ))) return NULL;
+        status = wine_nt_to_unix_file_name( &attr, buffer, &size, FILE_OPEN_IF );
+        if (status != STATUS_BUFFER_TOO_SMALL) break;
+        free( buffer );
+    }
+    if (status && status != STATUS_NO_SUCH_FILE)
+    {
+        free( buffer );
+        return NULL;
+    }
+    return buffer;
+}
+
 char *steamclient_dos_to_unix_path( const char *src, int is_url )
 {
     static const char file_prot[] = "file://";
@@ -442,22 +556,27 @@ char *steamclient_dos_to_unix_path( const char *src, int is_url )
     if (IS_ABSOLUTE( src ))
     {
         /* absolute path, use wine conversion */
-        WCHAR srcW[PATH_MAX] = {0};
+        WCHAR srcW[PATH_MAX] = {'\\', '?', '?', '\\', 0};
         char *unix_path;
         uint32_t r;
 
-        r = MultiByteToWideChar( CP_UNIXCP, 0, src, -1, srcW, PATH_MAX );
-        if (r == 0) return NULL;
+        if (is_url) while (*src == '/') ++src;
+        r = ntdll_umbstowcs( src, strlen( src ) + 1, srcW + 4, PATH_MAX - 4 );
+        if (r == 0) unix_path = NULL;
+        else
+        {
+            collapse_path( srcW, 4 );
+            unix_path = get_unix_file_name( srcW );
+        }
 
-        unix_path = wine_get_unix_file_name( srcW );
         if (!unix_path)
         {
             WARN( "Unable to convert DOS filename to unix: %s\n", src );
-            return NULL;
+            goto done;
         }
 
         lstrcpynA( dst, unix_path, PATH_MAX );
-        HeapFree( GetProcessHeap(), 0, unix_path );
+        free( unix_path );
     }
     else
     {
@@ -476,7 +595,7 @@ char *steamclient_dos_to_unix_path( const char *src, int is_url )
 
 done:
     len = strlen( buffer ) + 1;
-    if (!(dst = (char *)HeapAlloc( GetProcessHeap(), 0, len ))) return NULL;
+    if (!(dst = (char *)malloc( len ))) return NULL;
     memcpy( dst, buffer, len );
 
     TRACE( "-> %s\n", debugstr_a(dst) );
@@ -485,7 +604,7 @@ done:
 
 void steamclient_free_path( char *path )
 {
-    HeapFree( GetProcessHeap(), 0, path );
+    free( path );
 }
 
 const char **steamclient_dos_to_unix_path_array( const char **src )
@@ -493,7 +612,7 @@ const char **steamclient_dos_to_unix_path_array( const char **src )
     size_t len;
     const char **s;
     char **out, **o;
-    WCHAR scratch[PATH_MAX] = {0};
+    WCHAR scratch[PATH_MAX] = {'\\', '?', '?', '\\', 0};
 
     TRACE( "src %p\n", src );
 
@@ -502,21 +621,22 @@ const char **steamclient_dos_to_unix_path_array( const char **src )
     len = sizeof(char *); /* NUL */
     for (s = src; *s; ++s) len += sizeof(char *);
 
-    out = (char **)HeapAlloc( GetProcessHeap(), 0, len );
+    out = (char **)malloc( len );
 
     for (s = src, o = out; *s; ++s, ++o)
     {
         TRACE( "  src[%zu] %s\n", s - src, debugstr_a(*s) );
         if (IS_ABSOLUTE( *s ))
         {
-            MultiByteToWideChar( CP_UNIXCP, 0, *s, -1, scratch, PATH_MAX );
-            *o = wine_get_unix_file_name( scratch );
+            ntdll_umbstowcs( *s, strlen( *s ) + 1, scratch + 4, PATH_MAX - 4 );
+            collapse_path( scratch, 4 );
+            *o = get_unix_file_name( scratch );
         }
         else
         {
             const char *r;
             char *l;
-            *o = (char *)HeapAlloc( GetProcessHeap(), 0, strlen( *s ) + 1 );
+            *o = (char *)malloc( strlen( *s ) + 1 );
             for (r = *s, l = *o; *r; ++l, ++r)
             {
                 if (*r == '\\') *l = '/';
@@ -537,8 +657,8 @@ void steamclient_free_path_array( const char **path_array )
 {
     const char **path;
     if (!path_array) return;
-    for (path = path_array; *path; path++) HeapFree( GetProcessHeap(), 0, *(char **)path );
-    HeapFree( GetProcessHeap(), 0, path_array );
+    for (path = path_array; *path; path++) free( *(char **)path );
+    free( path_array );
 }
 
 /* Returns:
@@ -548,8 +668,10 @@ void steamclient_free_path_array( const char **path_array )
 unsigned int steamclient_unix_path_to_dos_path( bool api_result, const char *src, char *dst, uint32_t dst_bytes, int is_url )
 {
     static const char file_prot[] = "file://";
+    NTSTATUS status;
+    ULONG size = 0;
+    uint32_t r = 0;
     WCHAR *dosW;
-    uint32_t r;
 
     TRACE( "api_result %u, src %s, dst %p, dst_bytes %u is_url %u\n", api_result, debugstr_a(src), dst, dst_bytes, is_url );
 
@@ -580,22 +702,145 @@ unsigned int steamclient_unix_path_to_dos_path( bool api_result, const char *src
         dst_bytes -= 7;
     }
 
-    dosW = wine_get_dos_file_name( src );
-    if (!dosW)
+    status = wine_unix_to_nt_file_name( src, NULL, &size );
+    if (status != STATUS_BUFFER_TOO_SMALL)
     {
         WARN( "Unable to convert unix filename to DOS: %s.\n", debugstr_a(src) );
         *dst = 0;
         return 0;
     }
 
-    r = WideCharToMultiByte( CP_ACP, 0, dosW, -1, dst, dst_bytes, NULL, NULL );
-    if (!r)
+    dosW = (WCHAR *)malloc( size * sizeof(WCHAR) );
+    status = wine_unix_to_nt_file_name( src, dosW, &size );
+    if (!status) r = ntdll_wcstoumbs( dosW, size, dst, dst_bytes, FALSE );
+    else *dst = 0;
+    free( dosW );
+
+    if (!strncmp( dst, "\\??\\", 4 ))
     {
-        *dst = 0;
-        if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) r = PATH_MAX;
+        memmove( dst, dst + 4, r - 4 );
+        r -= 4;
     }
-    HeapFree( GetProcessHeap(), 0, dosW );
 
     TRACE( "-> dst %s, r %u\n", debugstr_a(dst), r );
     return r;
+}
+
+static const struct callback_def *find_first_callback_def_by_id( int id )
+{
+    unsigned int l, r, m;
+
+    l = 0;
+    r = callback_data_size;
+    while (l < r)
+    {
+        m = (l + r) /2;
+        if (callback_data[m].id == id)
+        {
+            while (m && callback_data[m - 1].id == id) --m;
+            return &callback_data[m];
+        }
+        if (id < callback_data[m].id) r = m;
+        else                          l = m + 1;
+    }
+    return NULL;
+}
+
+void *alloc_callback_wtou( int id, void *callback, int *callback_len )
+{
+    const struct callback_def *c, *end, *best;
+
+    if (!(c = find_first_callback_def_by_id( id ))) return callback;
+
+    end = callback_data + callback_data_size;
+    best = NULL;
+    while (c != end && c->id == id)
+    {
+        if (c->w_callback_len == *callback_len)
+        {
+            best = c;
+            break;
+        }
+        if (!best && *callback_len >= c->w_callback_len) best = c;
+        ++c;
+    }
+
+    if (!best)
+    {
+        ERR( "len %d is too small for callback %d, using default.\n", *callback_len, id );
+        best = find_first_callback_def_by_id( id );
+    }
+    if (best->w_callback_len != *callback_len)
+        WARN( "Found len %d for id %d, len %d.\n", best->w_callback_len, id, *callback_len );
+    *callback_len = best->u_callback_len;
+    return malloc( *callback_len );
+}
+
+void convert_callback_utow(int id, void *u_callback, int u_callback_len, void *w_callback, int w_callback_len)
+{
+    const struct callback_def *c, *end, *best;
+
+    if (!(c = find_first_callback_def_by_id( id )))
+    {
+        memcpy( w_callback, u_callback, u_callback_len );
+        return;
+    }
+
+    end = callback_data + callback_data_size;
+    best = NULL;
+    while (c != end && c->id == id)
+    {
+        if (c->w_callback_len == w_callback_len && c->u_callback_len == u_callback_len)
+        {
+            best = c;
+            break;
+        }
+        if ((!best || best->w_callback_len > w_callback_len)
+             && c->u_callback_len == u_callback_len && c->w_callback_len <= w_callback_len)
+            best = c;
+        if (!best && c->u_callback_len == u_callback_len)
+            best = c;
+        ++c;
+    }
+    if (!best)
+    {
+        ERR( "Could not find id %d, u_callback_len %d, w_callback_len %d.\n", id, u_callback_len, w_callback_len );
+        best = find_first_callback_def_by_id( id );
+    }
+
+    if (best->w_callback_len != w_callback_len || best->u_callback_len != u_callback_len)
+        WARN( "Found len %d, %d for id %d, len %d, %d.\n", best->w_callback_len, best->u_callback_len,
+              id, w_callback_len, u_callback_len );
+
+    if (best->conv_w_from_u) best->conv_w_from_u( w_callback, u_callback );
+    else                     memcpy( w_callback, u_callback, u_callback_len );
+}
+
+void callback_message_utow( const u_CallbackMsg_t *u_msg, w_CallbackMsg_t *w_msg )
+{
+    const struct callback_def *c, *end;
+    int len = u_msg->m_cubParam;
+
+    if ((c = find_first_callback_def_by_id( u_msg->m_iCallback )))
+    {
+        end = callback_data + callback_data_size;
+        while (c != end && c->id == u_msg->m_iCallback)
+        {
+            if (c->u_callback_len == u_msg->m_cubParam)
+            {
+                len = c->w_callback_len;
+                break;
+            }
+            ++c;
+        }
+        if (c == end || c->id != u_msg->m_iCallback)
+        {
+            ERR( "Unix len %d not found for callback %d.\n", u_msg->m_cubParam, u_msg->m_iCallback );
+            len = find_first_callback_def_by_id( u_msg->m_iCallback )->w_callback_len;
+        }
+    }
+
+    w_msg->m_hSteamUser = u_msg->m_hSteamUser;
+    w_msg->m_iCallback = u_msg->m_iCallback;
+    w_msg->m_cubParam = len;
 }

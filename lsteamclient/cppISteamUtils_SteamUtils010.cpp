@@ -1,6 +1,10 @@
 /* This file is auto-generated, do not edit. */
 #include "unix_private.h"
 
+#if 0
+#pragma makedep unix
+#endif
+
 NTSTATUS ISteamUtils_SteamUtils010_GetSecondsSinceAppActive( void *args )
 {
     struct ISteamUtils_SteamUtils010_GetSecondsSinceAppActive_params *params = (struct ISteamUtils_SteamUtils010_GetSecondsSinceAppActive_params *)args;
@@ -297,6 +301,14 @@ NTSTATUS ISteamUtils_SteamUtils010_DismissFloatingGamepadTextInput( void *args )
     struct ISteamUtils_SteamUtils010_DismissFloatingGamepadTextInput_params *params = (struct ISteamUtils_SteamUtils010_DismissFloatingGamepadTextInput_params *)args;
     struct u_ISteamUtils_SteamUtils010 *iface = (struct u_ISteamUtils_SteamUtils010 *)params->linux_side;
     params->_ret = iface->DismissFloatingGamepadTextInput(  );
+    return 0;
+}
+
+NTSTATUS ISteamUtils_SteamUtils010_DismissGamepadTextInput( void *args )
+{
+    struct ISteamUtils_SteamUtils010_DismissGamepadTextInput_params *params = (struct ISteamUtils_SteamUtils010_DismissGamepadTextInput_params *)args;
+    struct u_ISteamUtils_SteamUtils010 *iface = (struct u_ISteamUtils_SteamUtils010 *)params->linux_side;
+    params->_ret = iface->DismissGamepadTextInput(  );
     return 0;
 }
 

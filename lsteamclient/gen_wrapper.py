@@ -11,6 +11,8 @@ import os
 import re
 
 SDK_VERSIONS = [
+    "160",
+    "159",
     "158",
     "157",
     "156",
@@ -406,6 +408,9 @@ PATH_CONV_STRUCTS = {
     },
 }
 
+PRETOUCH_TYPES = {
+    "const char *": "    IsBadStringPtrA({0}, -1);\n",
+}
 
 class Padding:
     def __init__(self, offset, size):
@@ -451,6 +456,8 @@ class BasicType:
             return self._abi != other._abi
         return False
 
+
+written_converters = set()
 
 class Struct:
     def __init__(self, sdkver, abi, cursor):
@@ -552,17 +559,36 @@ class Struct:
 
     def write_converter(self, prefix, path_conv_fields):
         version = all_versions[sdkver][self.name]
+        from_abi = self._abi[0]
+        func_name = f'{version}_{prefix[0]}_from_{from_abi}'
+        if not func_name in written_converters:
+            written_converters.add(func_name)
+            out(f'static void {func_name}(void *dst, const void *src)\n')
+            out(u'{\n')
+            out(f'    {prefix[0]}_{version} *d = ({prefix[0]}_{version} *)dst;\n')
+            out(f'    const {from_abi}_{version} *s = (const {from_abi}_{version} *)src;\n\n')
+            for field in self.fields:
+                if field.name not in path_conv_fields:
+                    out(f'    d->{field.name} = s->{field.name};\n')
+                else:
+                    out(f'    steamclient_unix_path_to_dos_path(1, s->{field.name}, g_tmppath, TEMP_PATH_BUFFER_LENGTH, 1);\n')
+                    out(f'    d->{field.name} = g_tmppath;\n')
+            out(u'}\n')
+
+        if self._abi[1:3] == '64':
+            out(u'#ifdef __x86_64__\n')
+        elif self._abi[1:3] == '32':
+            out(u'#ifdef __i386__\n')
+        else:
+            assert False
+
         out(f'{self._abi}_{version}::operator {prefix}{version}() const\n')
         out(u'{\n')
         out(f'    {prefix}{version} ret;\n')
-        for field in self.fields:
-            if field.name not in path_conv_fields:
-                out(f'    ret.{field.name} = this->{field.name};\n')
-            else:
-                out(f'    steamclient_unix_path_to_dos_path(1, this->{field.name}, g_tmppath, sizeof(g_tmppath), 1);\n')
-                out(f'    ret.{field.name} = g_tmppath;\n')
+        out(f'    {func_name}((void *)&ret, (const void *)this);\n')
         out(u'    return ret;\n')
         out(u'}\n')
+        out(u'#endif\n\n')
 
     def needs_conversion(self, other):
         if other.id in self._conv_cache:
@@ -1062,6 +1088,14 @@ def handle_method_c(klass, method, winclassname, out):
 
     out(u'    TRACE("%p\\n", _this);\n')
 
+    # Some games pass pointers to the data in PE modules which have no access. Access violation is handled
+    # by VEH (which decrypts data and changes page protection). That can only work if such access violation happens
+    # on the PE side, so access the data before passing to the Unix side.
+    for _, p in enumerate(method.get_arguments()):
+        pretouch = PRETOUCH_TYPES.get(p.type.spelling)
+        if pretouch is not None:
+            out(pretouch.format(p.spelling))
+
     out(f'    STEAMCLIENT_CALL( {method.full_name}, &params );\n')
 
     if method.name.startswith('CreateFakeUDPPort'):
@@ -1084,6 +1118,10 @@ def handle_class(klass):
 
         out(u'/* This file is auto-generated, do not edit. */\n')
         out(u'#include "unix_private.h"\n\n')
+
+        out(u'#if 0\n')
+        out(u'#pragma makedep unix\n')
+        out(u'#endif\n\n')
 
         for method in klass.methods:
             if type(method) is Destructor:
@@ -1345,7 +1383,7 @@ with open("steamclient_generated.h", "w") as file:
     out(u'/* This file is auto-generated, do not edit. */\n\n')
 
     for _, klass in sorted(all_classes.items()):
-        out(f"extern struct w_steam_iface *create_win{klass.full_name}(void *) DECLSPEC_HIDDEN;\n")
+        out(f"extern struct w_steam_iface *create_win{klass.full_name}(void *);\n")
 
 
 with open("steamclient_generated.c", "w") as file:
@@ -1549,6 +1587,10 @@ with open('unixlib_generated.cpp', 'w') as file:
     out = file.write
 
     out(u'/* This file is auto-generated, do not edit. */\n\n')
+    out(u'#if 0\n')
+    out(u'#pragma makedep unix\n')
+    out(u'#endif\n')
+    out(u'\n')
     out(u'#include "unix_private.h"\n\n')
 
     out(u'extern "C" const unixlib_entry_t __wine_unix_call_funcs[] =\n')
@@ -1612,125 +1654,49 @@ with open('unixlib_generated.cpp', 'w') as file:
             path_conv_fields = PATH_CONV_STRUCTS.get(name, {})
 
             if abis["w64"].needs_conversion(abis["u64"]):
-                out(u'#ifdef __x86_64__\n')
                 abis['w64'].write_converter('u64_', {})
                 out(u'\n')
                 abis['u64'].write_converter('w64_', path_conv_fields)
-                out(u'#endif\n\n')
 
             if abis["w32"].needs_conversion(abis["u32"]):
-                out(u'#ifdef __i386__\n')
                 abis['w32'].write_converter('u32_', {})
                 out(u'\n')
                 abis['u32'].write_converter('w32_', path_conv_fields)
-                out(u'#endif\n\n')
 
-    out(u'void callback_message_utow( const u_CallbackMsg_t *u_msg, w_CallbackMsg_t *w_msg )\n')
-    out(u'{\n')
-    out(u'    int len;\n')
-    out(u'\n')
-    out(u'#define MAKE_CASE(id, wlen) ((uint64_t)(id) << 48) | ((uint64_t)(wlen) << 24)\n')
-    out(u'    switch (MAKE_CASE(u_msg->m_iCallback, u_msg->m_cubParam))\n')
-    out(u'    {\n')
     out(u'#ifdef __i386__\n')
-    values = set()
-    for cbid, sdkver, abis in sorted(callbacks, key=lambda x: x[0]):
-        name, value = abis["w32"].name, (cbid, abis["u32"].size)
-        if name in all_versions[sdkver]: name = all_versions[sdkver][name]
-        if value not in values:
-            out(f'    case MAKE_CASE({cbid}, {abis["u32"].size}): len = {abis["w32"].size}; break; /* {name} */\n')
-        else:
-            out(f'    /* Conflict: case MAKE_CASE({cbid}, {abis["u32"].size}): len = {abis["w32"].size}; break; */ /* {name} */\n')
-        values.add(value)
-    out(u'#endif\n')
-    out(u'#ifdef __x86_64__\n')
-    values = set()
-    for cbid, sdkver, abis in sorted(callbacks, key=lambda x: x[0]):
-        name, value = abis["w64"].name, (cbid, abis["u64"].size)
-        if name in all_versions[sdkver]: name = all_versions[sdkver][name]
-        if value not in values:
-            out(f'    case MAKE_CASE({cbid}, {abis["u64"].size}): len = {abis["w64"].size}; break; /* {name} */\n')
-        else:
-            out(f'    /* Conflict: case MAKE_CASE({cbid}, {abis["u64"].size}): len = {abis["w64"].size}; break; */ /* {name} */\n')
-        values.add(value)
-    out(u'#endif\n')
-    out(u'    default: len = u_msg->m_cubParam; break;\n')
-    out(u'    }\n')
-    out(u'#undef MAKE_CASE\n')
-    out(u'\n')
-    out(u'    w_msg->m_hSteamUser = u_msg->m_hSteamUser;\n')
-    out(u'    w_msg->m_iCallback = u_msg->m_iCallback;\n')
-    out(u'    w_msg->m_cubParam = len;\n')
-    out(u'}\n')
-    out(u'\n')
-
-    out(u'void *alloc_callback_wtou(int id, void *callback, int *callback_len)\n')
-    out(u'{\n')
-    out(u'    int len;\n')
-    out(u'\n')
-    out(u'#define MAKE_CASE(id, wlen) ((uint64_t)(id) << 48) | ((uint64_t)(wlen) << 24)\n')
-    out(u'    switch (MAKE_CASE(id, *callback_len))\n')
-    out(u'    {\n')
-    out(u'#ifdef __i386__\n')
-    values = set()
-    for cbid, sdkver, abis in sorted(callbacks, key=lambda x: x[0]):
-        name, value = abis["u32"].name, (cbid, abis["w32"].size)
-        if name in all_versions[sdkver]: name = all_versions[sdkver][name]
-        if value not in values:
-            out(f'    case MAKE_CASE({cbid}, {abis["w32"].size}): len = {abis["u32"].size}; break; /* {name} */\n')
-        else:
-            out(f'    /* case MAKE_CASE({cbid}, {abis["w32"].size}): len = {abis["u32"].size}; break; {name} */\n')
-        values.add(value)
-    out(u'#endif\n')
-    out(u'#ifdef __x86_64__\n')
-    values = set()
-    for cbid, sdkver, abis in sorted(callbacks, key=lambda x: x[0]):
-        name, value = abis["u64"].name, (cbid, abis["w64"].size)
-        if name in all_versions[sdkver]: name = all_versions[sdkver][name]
-        if value not in values:
-            out(f'    case MAKE_CASE({cbid}, {abis["w64"].size}): len = {abis["u64"].size}; break; /* {name} */\n')
-        else:
-            out(f'    /* case MAKE_CASE({cbid}, {abis["w64"].size}): len = {abis["u64"].size}; break; {name} */\n')
-        values.add(value)
-    out(u'#endif\n')
-    out(u'    default: return callback;\n')
-    out(u'    }\n')
-    out(u'#undef MAKE_CASE\n')
-    out(u'\n')
-    out(u'    callback = HeapAlloc( GetProcessHeap(), 0, len );\n')
-    out(u'    *callback_len = len;\n')
-    out(u'    return callback;\n')
-    out(u'}\n')
-    out(u'\n')
-
-    out(u'void convert_callback_utow(int id, void *u_callback, int u_callback_len, void *w_callback, int w_callback_len)\n')
-    out(u'{\n')
-    out(u'#define MAKE_CASE(id, wlen, ulen) ((uint64_t)(id) << 48) | ((uint64_t)(wlen) << 24) | (uint64_t)(ulen)\n')
-    out(u'    switch (MAKE_CASE(id, w_callback_len, u_callback_len))\n')
-    out(u'    {\n')
-    out(u'#ifdef __i386__\n')
+    out(u'const struct callback_def callback_data[] =\n{\n');
     values = set()
     for cbid, sdkver, abis in sorted(callbacks, key=lambda x: x[0]):
         name, value = abis["u32"].name, (cbid, abis["w32"].size, abis["u32"].size)
         if name in all_versions[sdkver]: name = all_versions[sdkver][name]
+
+        w_from_u = f'{name}_w_from_u'
+        if not w_from_u in written_converters:
+            w_from_u = u'nullptr'
+
         if value not in values:
-            out(f'    case MAKE_CASE({cbid}, {abis["w32"].size}, {abis["u32"].size}): *(w_{name} *)w_callback = *(u_{name} *)u_callback; break;\n')
+            out(f'    {{ {cbid}, {sdkver}, {abis["w32"].size}, {abis["u32"].size}, {w_from_u} }},\n')
         else:
-            out(f'    /* case MAKE_CASE({cbid}, {abis["w32"].size}, {abis["u32"].size}): *(w_{name} *)w_callback = *(u_{name} *)u_callback; break; */\n')
+            out(f'    /*{{ {cbid}, {sdkver}, {abis["w32"].size}, {abis["u32"].size}, {w_from_u} }},*/\n')
         values.add(value)
+    out(u'};\n');
     out(u'#endif\n')
     out(u'#ifdef __x86_64__\n')
+    out(u'const struct callback_def callback_data[] =\n{\n');
     values = set()
     for cbid, sdkver, abis in sorted(callbacks, key=lambda x: x[0]):
         name, value = abis["u64"].name, (cbid, abis["w64"].size, abis["u64"].size)
         if name in all_versions[sdkver]: name = all_versions[sdkver][name]
+
+        w_from_u = f'{name}_w_from_u'
+        if not w_from_u in written_converters:
+            w_from_u = u'nullptr'
+
         if value not in values:
-            out(f'    case MAKE_CASE({cbid}, {abis["w64"].size}, {abis["u64"].size}): *(w_{name} *)w_callback = *(u_{name} *)u_callback; break;\n')
+            out(f'    {{ {cbid}, {sdkver}, {abis["w64"].size}, {abis["u64"].size}, {w_from_u} }},\n')
         else:
-            out(f'    /* case MAKE_CASE({cbid}, {abis["w64"].size}, {abis["u64"].size}): *(w_{name} *)w_callback = *(u_{name} *)u_callback; break; */\n')
+            out(f'    /*{{ {cbid}, {sdkver}, {abis["w64"].size}, {abis["u64"].size}, {w_from_u} }},*/\n')
         values.add(value)
+    out(u'};\n');
     out(u'#endif\n')
-    out(u'    default: memcpy( w_callback, u_callback, u_callback_len ); break;\n')
-    out(u'    }\n')
-    out(u'#undef MAKE_CASE\n')
-    out(u'}\n')
+    out(u'const unsigned int callback_data_size = ARRAY_SIZE(callback_data);\n');
